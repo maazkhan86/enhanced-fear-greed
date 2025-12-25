@@ -1,7 +1,8 @@
 import os
 import re
+import json
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from collections import Counter
 
 import requests
@@ -21,6 +22,13 @@ try:
 except Exception:
     WORDCLOUD_AVAILABLE = False
 
+# Optional BeautifulSoup (recommended for CBOE parsing robustness)
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except Exception:
+    BS4_AVAILABLE = False
+
 
 # ----------------------------
 # App config
@@ -28,24 +36,26 @@ except Exception:
 st.set_page_config(page_title="Enhanced Fear & Greed Index", layout="wide")
 
 HISTORICAL_FILE = "historical_scores.csv"
+LAST_KNOWN_FILE = "last_known.json"
 
-# Hard-coded sources for "overall market"
 DEFAULT_SUBREDDITS = ["wallstreetbets", "stocks", "investing"]
 
-# Composite rules
 MIN_COMPONENTS_FOR_COMPOSITE = 2
 
-# Endpoints
 CNN_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CBOE_URL = "https://www.cboe.com/us/options/market_statistics/daily/"
-REDDIT_NEW_JSON = "https://api.reddit.com/r/{sub}/new?limit={limit}"
 
-# Trends keywords (fear vs greed)
+# Two endpoints (cloud environments sometimes block one but not the other)
+REDDIT_ENDPOINTS = [
+    "https://api.reddit.com/r/{sub}/new?limit={limit}",
+    "https://www.reddit.com/r/{sub}/new.json?limit={limit}",
+]
+
 FEAR_TERMS = ["stock market crash", "recession", "bear market", "market selloff"]
 GREED_TERMS = ["buy stocks", "bull market", "stock rally", "call options"]
 
 BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EnhancedFearGreed/1.1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EnhancedFearGreed/1.2",
     "Accept": "application/json,text/plain,*/*",
 }
 CNN_HEADERS = {
@@ -54,7 +64,6 @@ CNN_HEADERS = {
     "Origin": "https://edition.cnn.com",
 }
 
-# Simple stopwords for word/phrase extraction
 STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "is", "are",
     "was", "were", "be", "been", "it", "this", "that", "as", "at", "by", "from",
@@ -65,11 +74,60 @@ STOPWORDS = {
 
 
 # ----------------------------
+# Last-known storage (prevents empty dashboard)
+# ----------------------------
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+def load_last_known():
+    try:
+        if os.path.exists(LAST_KNOWN_FILE):
+            with open(LAST_KNOWN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_last_known(d):
+    try:
+        with open(LAST_KNOWN_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
+
+def get_last_known_value(store, key, max_age_hours=72):
+    """
+    Returns (value, used_last_known_bool)
+    """
+    rec = store.get(key)
+    if not rec:
+        return None, False
+    ts = rec.get("updated_at")
+    val = rec.get("value")
+    if val is None or ts is None:
+        return None, False
+
+    try:
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        age_hours = (datetime.now(timezone.utc) - t).total_seconds() / 3600.0
+        if age_hours <= max_age_hours:
+            return val, True
+    except Exception:
+        return None, False
+
+    return None, False
+
+def set_last_known_value(store, key, value):
+    if value is None:
+        return
+    store[key] = {"value": value, "updated_at": utc_now_iso()}
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
 def clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, x))
-
 
 def safe_float(x):
     try:
@@ -82,10 +140,9 @@ def safe_float(x):
     except Exception:
         return None
 
-
 def request_with_retry(url, headers=None, params=None, timeout=15, attempts=4, backoff=1.5):
     """
-    Basic retry for rate-limits / transient blocks.
+    Retry for rate-limits / transient blocks.
     Returns (response_or_none, debug_string)
     """
     headers = headers or BASE_HEADERS
@@ -104,7 +161,6 @@ def request_with_retry(url, headers=None, params=None, timeout=15, attempts=4, b
             time.sleep(backoff * (i + 1))
     return None, last
 
-
 def market_label(score: float) -> str:
     if score is None:
         return "Unknown"
@@ -118,7 +174,6 @@ def market_label(score: float) -> str:
         return "Greed"
     return "Extreme Greed"
 
-
 def confidence_label(available: int, total: int) -> str:
     if total <= 0:
         return "Unknown"
@@ -130,7 +185,6 @@ def confidence_label(available: int, total: int) -> str:
         return "Low"
     return "Unknown"
 
-
 def clean_text(s: str) -> str:
     if not s:
         return ""
@@ -139,7 +193,6 @@ def clean_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
 def extract_words(texts, top_n=40):
     words = []
     for t in texts:
@@ -147,7 +200,6 @@ def extract_words(texts, top_n=40):
         ws = [w for w in t.split() if len(w) > 2 and w not in STOPWORDS]
         words.extend(ws)
     return Counter(words).most_common(top_n)
-
 
 def extract_phrases(texts, top_n=25):
     bigrams = []
@@ -160,31 +212,26 @@ def extract_phrases(texts, top_n=25):
 
 
 # ----------------------------
-# Data fetchers (cached)
+# Fetchers
 # ----------------------------
 @st.cache_data(ttl=300)
 def get_cnn_fear_greed():
-    """
-    Returns: (score_0_100, rating_text, debug)
-    """
     r, debug = request_with_retry(
         CNN_URL,
         headers=CNN_HEADERS,
-        params={"_": int(time.time())},  # cachebuster
+        params={"_": int(time.time())},
         timeout=12,
         attempts=4,
         backoff=1.6,
     )
     if r is None:
         return None, None, debug
-
     try:
         data = r.json()
         fag = data.get("fear_and_greed", {})
         score = safe_float(fag.get("score"))
         rating = fag.get("rating")
 
-        # fallback if structure changes
         if score is None:
             series = fag.get("data")
             if isinstance(series, list) and series:
@@ -199,7 +246,7 @@ def get_cnn_fear_greed():
 
 
 @st.cache_data(ttl=600)
-def get_vix_value():
+def get_vix_value_yfinance():
     try:
         vix = yf.Ticker("^VIX")
         hist = vix.history(period="5d", interval="1d")
@@ -210,31 +257,71 @@ def get_vix_value():
         return None
 
 
+@st.cache_data(ttl=600)
+def get_vix_value_stooq():
+    """
+    Fallback if yfinance fails: Stooq CSV endpoint.
+    """
+    try:
+        url = "https://stooq.com/q/l/?s=vix&i=d"
+        r, _ = request_with_retry(url, headers=BASE_HEADERS, timeout=12, attempts=3, backoff=1.4)
+        if r is None:
+            return None
+        df = pd.read_csv(pd.compat.StringIO(r.text)) if hasattr(pd, "compat") else pd.read_csv(pd.io.common.StringIO(r.text))
+        # Some pandas builds differ; safer:
+    except Exception:
+        try:
+            import io
+            df = pd.read_csv(io.StringIO(r.text))
+        except Exception:
+            return None
+
+    try:
+        df = df.dropna(subset=["Close"])
+        if df.empty:
+            return None
+        return float(df["Close"].iloc[-1])
+    except Exception:
+        return None
+
+
 def vix_to_score(vix: float) -> float:
     if vix is None:
         return None
-    # heuristic range: 10 calm -> 40 fearful
     return clamp((40.0 - vix) / (40.0 - 10.0) * 100.0)
+
+
+def extract_equity_pcr(html: str):
+    """
+    Primary: regex on raw HTML.
+    Fallback: BeautifulSoup text + regex (more resilient to markup/spacing).
+    """
+    m = re.search(r"EQUITY\s+PUT/CALL\s+RATIO[^0-9]*([0-9]+\.[0-9]+)", html, re.I)
+    if m:
+        return safe_float(m.group(1))
+
+    if BS4_AVAILABLE:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            text = " ".join(soup.get_text(" ").split())
+            m2 = re.search(r"EQUITY\s+PUT/CALL\s+RATIO[^0-9]*([0-9]+\.[0-9]+)", text, re.I)
+            if m2:
+                return safe_float(m2.group(1))
+        except Exception:
+            return None
+
+    return None
 
 
 @st.cache_data(ttl=3600)
 def get_put_call_ratio_equity():
-    """
-    CBOE equity put/call ratio via date param + regex.
-    Returns float or None.
-    """
     dt = date.today().isoformat()
     url = f"{CBOE_URL}?dt={dt}"
     r, _ = request_with_retry(url, headers=BASE_HEADERS, timeout=15, attempts=4, backoff=1.5)
     if r is None:
         return None
 
-    html = r.text
-    m = re.search(r"EQUITY\s+PUT/CALL\s+RATIO[^0-9]*([0-9]+\.[0-9]+)", html, re.I)
-    if not m:
-        return None
-
-    val = safe_float(m.group(1))
+    val = extract_equity_pcr(r.text)
     if val is not None and 0.2 <= val <= 2.5:
         return float(val)
     return None
@@ -243,15 +330,11 @@ def get_put_call_ratio_equity():
 def pcr_to_score(pcr: float) -> float:
     if pcr is None:
         return None
-    # heuristic range: 0.5 greedy -> 1.3 fearful
     return clamp((1.3 - pcr) / (1.3 - 0.5) * 100.0)
 
 
 @st.cache_data(ttl=1800)
 def get_google_trends_score():
-    """
-    Returns float 0–100 or None.
-    """
     try:
         pytrends = TrendReq(
             hl="en-US",
@@ -271,7 +354,7 @@ def get_google_trends_score():
         greed = float(means[GREED_TERMS].mean())
 
         eps = 1e-9
-        net = (greed - fear) / (greed + fear + eps)  # approx [-1..+1]
+        net = (greed - fear) / (greed + fear + eps)
         score = 50.0 + 50.0 * net
         return clamp(score)
     except Exception:
@@ -279,49 +362,53 @@ def get_google_trends_score():
 
 
 @st.cache_data(ttl=600)
-def fetch_reddit_posts(sub: str, limit: int = 50):
+def fetch_reddit_posts(sub: str, limit: int = 60):
     """
-    Returns list of dicts {title, selftext, upvotes, num_comments}
+    Tries multiple Reddit endpoints.
     """
-    url = REDDIT_NEW_JSON.format(sub=sub, limit=limit)
-    r, debug = request_with_retry(url, headers=BASE_HEADERS, timeout=15, attempts=4, backoff=1.6)
-    if r is None:
-        raise RuntimeError(debug)
+    last_err = None
+    for tmpl in REDDIT_ENDPOINTS:
+        url = tmpl.format(sub=sub, limit=limit)
+        r, debug = request_with_retry(url, headers=BASE_HEADERS, timeout=15, attempts=3, backoff=1.6)
+        if r is None:
+            last_err = debug
+            continue
 
-    data = r.json()
-    children = data.get("data", {}).get("children", [])
-    posts = []
-    for c in children:
-        d = c.get("data", {}) or {}
-        posts.append({
-            "title": d.get("title", "") or "",
-            "selftext": d.get("selftext", "") or "",
-            "upvotes": int(d.get("score") or 0),
-            "num_comments": int(d.get("num_comments") or 0),
-        })
-    return posts
+        try:
+            data = r.json()
+            children = data.get("data", {}).get("children", [])
+            posts = []
+            for c in children:
+                d = c.get("data", {}) or {}
+                posts.append({
+                    "title": d.get("title", "") or "",
+                    "selftext": d.get("selftext", "") or "",
+                    "upvotes": int(d.get("score") or 0),
+                    "num_comments": int(d.get("num_comments") or 0),
+                })
+            if posts:
+                return posts
+            last_err = "no posts"
+        except Exception as e:
+            last_err = f"parse error: {e}"
+            continue
+
+    raise RuntimeError(last_err or "Reddit unavailable")
 
 
 def score_reddit_subreddit(sub: str, analyzer: SentimentIntensityAnalyzer):
-    """
-    Broad market mood (no ticker filter).
-    Returns: score_0_100, avg_compound, posts_used, texts_used, note
-    """
     try:
         posts = fetch_reddit_posts(sub, limit=60)
     except Exception as e:
         return None, None, 0, [], f"unavailable ({e})"
 
     compounds, weights, used = [], [], []
-
     for p in posts:
         text = (p.get("title", "") + " " + p.get("selftext", "")).strip()
         if not text:
             continue
 
         comp = analyzer.polarity_scores(text)["compound"]
-
-        # modest weighting by engagement (keeps signal stable)
         up = p.get("upvotes", 0)
         cm = p.get("num_comments", 0)
         w = 1.0 + (min(up, 5000) ** 0.5) / 30.0 + (min(cm, 2000) ** 0.5) / 25.0
@@ -339,22 +426,7 @@ def score_reddit_subreddit(sub: str, analyzer: SentimentIntensityAnalyzer):
     return score, avg_comp, len(compounds), used, None
 
 
-def compute_composite_score(
-    cnn_score,
-    reddit_score,
-    vix_score,
-    pcr_score,
-    trends_score,
-    reddit_weight_pct: float
-):
-    """
-    Composite:
-    - If Reddit exists, allocate user-defined weight to Reddit.
-    - Remaining weight allocated across CNN/VIX/PCR/Trends.
-    - Missing dropped + renormalized.
-    - Require at least MIN_COMPONENTS_FOR_COMPOSITE components.
-    Returns: composite, weights_norm, components, note
-    """
+def compute_composite_score(cnn_score, reddit_score, vix_score, pcr_score, trends_score, reddit_weight_pct: float):
     components = {}
     weights = {}
 
@@ -423,7 +495,7 @@ def save_history_row(row: dict):
 
 
 # ----------------------------
-# UI (Retail-friendly)
+# UI
 # ----------------------------
 st.title("Enhanced Fear & Greed Index 📈📉")
 st.caption("A simple snapshot of overall market mood using multiple public signals.")
@@ -437,33 +509,32 @@ with st.form("run_form"):
     )
     submitted = st.form_submit_button("▶ Run analysis")
 
-# Don’t run anything until user clicks
 if not submitted:
     st.info("Ready when you are. Click **Run analysis** to generate today’s snapshot.")
     st.caption("Data sources: CNN, Reddit, CBOE, Google Trends, Yahoo Finance • Educational only")
     st.stop()
 
+store = load_last_known()
 analyzer = SentimentIntensityAnalyzer()
 
 with st.spinner("Running analysis…"):
-    # Core
-    cnn_score, cnn_rating, cnn_debug = get_cnn_fear_greed()
+    # CNN
+    cnn_score, cnn_rating, _ = get_cnn_fear_greed()
+    if cnn_score is not None:
+        set_last_known_value(store, "cnn_score", cnn_score)
 
-    # Reddit (per-sub)
+    # Reddit
     subreddit_rows = []
     all_texts = []
     reddit_scores = []
-    reddit_notes = {}
 
     for sub in DEFAULT_SUBREDDITS:
         time.sleep(0.15)
-        s_score, s_comp, n_used, texts_used, note = score_reddit_subreddit(sub, analyzer)
+        s_score, s_comp, n_used, texts_used, _ = score_reddit_subreddit(sub, analyzer)
         if texts_used:
             all_texts.extend(texts_used)
         if s_score is not None:
             reddit_scores.append(s_score)
-        if note:
-            reddit_notes[sub] = note
 
         subreddit_rows.append({
             "subreddit": sub,
@@ -473,16 +544,41 @@ with st.spinner("Running analysis…"):
         })
 
     reddit_score = round(float(sum(reddit_scores) / len(reddit_scores)), 1) if reddit_scores else None
+    if reddit_score is not None:
+        set_last_known_value(store, "reddit_score", reddit_score)
 
-    # Market signals
-    vix_val = get_vix_value()
+    # VIX (yfinance -> stooq -> last-known)
+    vix_val = get_vix_value_yfinance()
+    used_last_vix = False
+    if vix_val is None:
+        vix_val = get_vix_value_stooq()
+    if vix_val is None:
+        vix_val, used_last_vix = get_last_known_value(store, "vix_raw", max_age_hours=72)
+    if vix_val is not None and not used_last_vix:
+        set_last_known_value(store, "vix_raw", vix_val)
+
     vix_score = None if vix_val is None else round(vix_to_score(vix_val), 1)
 
+    # Put/Call (live -> last-known)
     pcr_val = get_put_call_ratio_equity()
+    used_last_pcr = False
+    if pcr_val is None:
+        pcr_val, used_last_pcr = get_last_known_value(store, "putcall_raw", max_age_hours=96)
+    if pcr_val is not None and not used_last_pcr:
+        set_last_known_value(store, "putcall_raw", pcr_val)
+
     pcr_score = None if pcr_val is None else round(pcr_to_score(pcr_val), 1)
 
+    # Trends (live -> last-known)
     trends_score = get_google_trends_score()
-    trends_score = None if trends_score is None else round(float(trends_score), 1)
+    used_last_trends = False
+    if trends_score is None:
+        trends_score, used_last_trends = get_last_known_value(store, "trends_score", max_age_hours=96)
+    if trends_score is not None and not used_last_trends:
+        set_last_known_value(store, "trends_score", trends_score)
+
+    # Save last-known values
+    save_last_known(store)
 
     # Composite
     composite, weights_used, comps_used, composite_note = compute_composite_score(
@@ -495,7 +591,7 @@ with st.spinner("Running analysis…"):
     )
 
 # Coverage / Confidence
-total_signals = 5  # CNN, Reddit, VIX, Put/Call, Trends
+total_signals = 5
 available_signals = sum([
     1 if cnn_score is not None else 0,
     1 if reddit_score is not None else 0,
@@ -510,11 +606,11 @@ conf = confidence_label(available_signals, total_signals)
 # ----------------------------
 st.markdown("## Today’s Market Mood")
 
-headline_left, headline_right = st.columns([2, 1])
-with headline_left:
+hl, hr = st.columns([2, 1])
+with hl:
     if composite is None:
         st.subheader("Not enough signals to produce a composite score today")
-        st.write("Some data sources are temporarily unavailable. Try again later.")
+        st.write("Some sources are temporarily unavailable. Try again later.")
         if composite_note:
             st.caption(composite_note)
     else:
@@ -522,7 +618,7 @@ with headline_left:
         st.write(f"**Mood:** {market_label(composite)}")
         st.caption(f"Coverage: {available_signals}/{total_signals} signals • Confidence: {conf}")
 
-with headline_right:
+with hr:
     st.markdown("**Signals used today**")
     used = []
     if cnn_score is not None: used.append("CNN")
@@ -533,39 +629,38 @@ with headline_right:
     st.write(", ".join(used) if used else "None")
 
 # ----------------------------
-# Core sentiment cards
+# Key signals
 # ----------------------------
 st.markdown("## Key Signals")
 
 c1, c2, c3 = st.columns(3)
-
 with c1:
     st.metric("CNN Fear & Greed", "N/A" if cnn_score is None else f"{cnn_score:.1f}")
-    if cnn_score is not None:
-        st.caption(f"Label: {cnn_rating if cnn_rating else 'N/A'} • Source: CNN")
-    else:
-        st.caption("Unavailable right now • Source: CNN")
+    st.caption(f"Label: {cnn_rating if cnn_rating else 'N/A'} • Source: CNN")
 
 with c2:
     st.metric("Reddit mood", "N/A" if reddit_score is None else f"{reddit_score:.1f}")
     st.caption("Source: Reddit (overall market discussions)")
 
 with c3:
-    st.metric("VIX (market calmness)", "N/A" if vix_val is None else f"{vix_val:.2f}")
-    st.caption("Lower VIX usually means calmer markets")
+    vix_label = "N/A" if vix_val is None else f"{float(vix_val):.2f}"
+    st.metric("VIX (market calmness)", vix_label)
+    if used_last_vix:
+        st.caption("Showing last known value (up to 3 days)")
+    else:
+        st.caption("Lower VIX usually means calmer markets")
 
-# Secondary signals row
 s1, s2 = st.columns(2)
 with s1:
-    st.metric("Options hedging (Put/Call)", "N/A" if pcr_val is None else f"{pcr_val:.3f}")
-    st.caption("Higher Put/Call can mean more hedging / fear")
-with s2:
-    st.metric("Search interest (Google Trends)", "N/A" if trends_score is None else f"{trends_score:.1f}")
-    st.caption("Compares fear vs greed search terms (last 7 days)")
+    pcr_label = "N/A" if pcr_val is None else f"{float(pcr_val):.3f}"
+    st.metric("Options hedging (Put/Call)", pcr_label)
+    st.caption("Higher Put/Call can mean more hedging / fear" + (" • Last known" if used_last_pcr else ""))
 
-# ----------------------------
-# What went into the score (retail-friendly)
-# ----------------------------
+with s2:
+    t_label = "N/A" if trends_score is None else f"{float(trends_score):.1f}"
+    st.metric("Search interest (Google Trends)", t_label)
+    st.caption("Compares fear vs greed search terms (last 7 days)" + (" • Last known" if used_last_trends else ""))
+
 with st.expander("What went into today’s score"):
     rows = []
     def add_row(name, val):
@@ -574,13 +669,11 @@ with st.expander("What went into today’s score"):
             "Score (0–100)": "N/A" if val is None else round(float(val), 1),
             "Status": "Available" if val is not None else "Unavailable"
         })
-
     add_row("CNN", cnn_score)
     add_row("Reddit mood", reddit_score)
     add_row("VIX calmness", vix_score)
     add_row("Options hedging", pcr_score)
     add_row("Search interest", trends_score)
-
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     if composite is not None and weights_used:
@@ -592,9 +685,7 @@ with st.expander("What went into today’s score"):
         } for k, v in weights_used.items()]).sort_values("Weight", ascending=False)
         st.dataframe(wdf, use_container_width=True)
 
-# ----------------------------
-# Reddit breakdown (only if Reddit works)
-# ----------------------------
+# Reddit sections only if available
 if reddit_score is not None:
     st.markdown("## Reddit Breakdown")
     sub_df = pd.DataFrame(subreddit_rows)
@@ -602,15 +693,13 @@ if reddit_score is not None:
 
     chart_df = sub_df.dropna(subset=["score_0_100"])
     if not chart_df.empty:
-        fig = px.bar(chart_df, x="subreddit", y="score_0_100",
-                     title="Reddit mood score by subreddit (0–100)")
+        fig = px.bar(chart_df, x="subreddit", y="score_0_100", title="Reddit mood score by subreddit (0–100)")
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("## Crowd Language (Reddit)")
     if all_texts:
         words = extract_words(all_texts, top_n=40)
         phrases = extract_phrases(all_texts, top_n=25)
-
         wcol, pcol = st.columns(2)
         with wcol:
             st.markdown("**Top words**")
@@ -630,9 +719,7 @@ if reddit_score is not None:
 else:
     st.info("Reddit mood is temporarily unavailable, so the Reddit breakdown is hidden for now.")
 
-# ----------------------------
-# Historical trends (keep it simple)
-# ----------------------------
+# Historical
 st.markdown("## Historical Trends")
 
 history_row = {
@@ -644,9 +731,8 @@ history_row = {
     "putcall_score": None if pcr_score is None else round(float(pcr_score), 1),
     "trends_score": None if trends_score is None else round(float(trends_score), 1),
     "composite_score": None if composite is None else round(float(composite), 1),
-    "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    "updated_at": utc_now_iso(),
 }
-
 try:
     save_history_row(history_row)
 except Exception:
@@ -670,17 +756,13 @@ if os.path.exists(HISTORICAL_FILE):
     except Exception:
         st.warning("Could not read the historical file.")
 
-# ----------------------------
-# “Details” expander (non-technical but helpful)
-# ----------------------------
 with st.expander("Details (why something might show N/A)"):
     st.write(
         "Sometimes a public source temporarily limits access. When that happens, we hide the signal and "
         "automatically adjust the composite to use only what’s available."
     )
-    st.write("If this keeps happening, try again later or refresh.")
+    st.write("When possible, we show a recent last known value to keep the snapshot useful.")
 
-# Controls
 col_r, col_c = st.columns([1, 1])
 with col_r:
     if st.button("🔄 Clear cache and refresh"):
