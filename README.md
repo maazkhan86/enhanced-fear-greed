@@ -12,7 +12,7 @@ It delivers a faster, more retail-focused view of market psychology — helping 
 ## ✨ Key Features
 
 - 📊 **Live CNN Fear & Greed Index** – the official baseline  
-- 🧠 **Reddit Sentiment Proxy** – real-time VADER analysis of posts & comments  
+- 🧠 Reddit Sentiment Proxy – real-time analysis of public posts & comments (via respectful scraping, no API key required)
 - ⚖️ **Custom Composite Score** – blend CNN + Reddit with an adjustable slider  
 - 📅 **Historical Trends** – track scores over days/weeks with interactive charts  
 - 🔍 **Subreddit Breakdown** – radar chart comparing sentiment across communities  
@@ -24,7 +24,7 @@ It delivers a faster, more retail-focused view of market psychology — helping 
 - 🎯 **Stock-Specific Mode** – focus sentiment on any ticker (e.g., NVDA, TSLA)  
 - ⚠️ **Smart Alerts** – clear warnings for extreme greed or fear  
 
-All data sources are **100% free** and public — no paid APIs required.
+All data sources are 100% free and public — no paid APIs or credentials needed.
 
 ## 🚀 Quick Start
 
@@ -39,25 +39,22 @@ All data sources are **100% free** and public — no paid APIs required.
    source venv/bin/activate        # Windows: venv\Scripts\activate
    ```
 
+3. **Activate the virtual environment**
+
+  ```bash
+  # On macOS/Linux
+  source venv/bin/activate
+  ```
+
+# On Windows
+venv\Scripts\activate
+
 3. **Install dependencies**
   ```bash
   pip install -r requirements.txt
   ```
 
-4. **Get free Reddit API credentials**
-
-- Go to: https://www.reddit.com/prefs/apps
-- Create a script app
-- Copy your client ID and client secret
-   
-5. **Create a** .env **file** in the project root
-  ```env
-  REDDIT_CLIENT_ID=your_client_id
-  REDDIT_CLIENT_SECRET=your_client_secret
-  REDDIT_USER_AGENT=enhanced_fear_greed/1.0 (by /u/your_reddit_username)
-  ```
-
-6. **Launch the app**
+4. **Launch the app**
    ```bash
    streamlit run app.py
    ```
@@ -81,5 +78,5 @@ Add new data sources
 Improve sentiment models
 Enhance visualizations
 
-Built with ❤️ using Python, Streamlit, PRAW, VADER, yfinance, and public data sources.
+Built with ❤️ using Python, Streamlit, BeautifulSoup, VADER, yfinance, and public data sources.
 Thank you for checking out Enhanced Fear & Greed Index — stay calm while the crowd panics (or gets euphoric)! 📊
