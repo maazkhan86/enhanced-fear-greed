@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from datetime import datetime, date
+from datetime import date
 from collections import Counter
 
 import requests
@@ -27,8 +27,15 @@ except Exception:
 # ----------------------------
 st.set_page_config(page_title="Enhanced Fear & Greed Index", layout="wide")
 
-HEADERS = {
-    "User-Agent": "EnhancedFearGreed/1.0 (Streamlit; github.com/maazkhan86) "
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EnhancedFearGreed/1.0",
+    "Accept": "application/json,text/plain,*/*",
+}
+
+CNN_HEADERS = {
+    **BASE_HEADERS,
+    "Referer": "https://edition.cnn.com/",
+    "Origin": "https://edition.cnn.com",
 }
 
 HISTORICAL_FILE = "historical_scores.csv"
@@ -39,12 +46,15 @@ CNN_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 # CBOE daily market stats page (HTML)
 CBOE_URL = "https://www.cboe.com/us/options/market_statistics/daily/"
 
-# Reddit public JSON (no API key)
-REDDIT_NEW_JSON = "https://www.reddit.com/r/{sub}/new.json?limit={limit}"
+# Reddit public JSON (no API key) — api domain works better on hosted envs
+REDDIT_NEW_JSON = "https://api.reddit.com/r/{sub}/new?limit={limit}"
 
 # Google Trends keywords
 FEAR_TERMS = ["stock market crash", "recession", "bear market", "market selloff"]
 GREED_TERMS = ["buy stocks", "bull market", "stock rally", "call options"]
+
+# Composite: require at least this many non-missing components
+MIN_COMPONENTS_FOR_COMPOSITE = 2
 
 # Basic stopwords for word/phrase extraction
 STOPWORDS = {
@@ -69,17 +79,13 @@ def safe_float(x):
             return None
         if isinstance(x, (int, float)):
             return float(x)
-        s = str(x).strip()
-        s = s.replace(",", "")
+        s = str(x).strip().replace(",", "")
         return float(s)
     except Exception:
         return None
 
 
 def parse_tickers(ticker_input: str):
-    """
-    Accepts "NVDA, TSLA" -> ["NVDA", "TSLA"]
-    """
     if not ticker_input:
         return []
     parts = [p.strip().upper() for p in ticker_input.split(",")]
@@ -91,7 +97,6 @@ def contains_any_ticker(text: str, tickers):
         return True
     if not text:
         return False
-    # Match word-boundary tickers to reduce false hits
     for t in tickers:
         if re.search(rf"\b{re.escape(t)}\b", text.upper()):
             return True
@@ -101,7 +106,7 @@ def contains_any_ticker(text: str, tickers):
 def clean_text(s: str) -> str:
     if not s:
         return ""
-    s = re.sub(r"http\S+", " ", s)     # remove links
+    s = re.sub(r"http\S+", " ", s)
     s = re.sub(r"[^A-Za-z0-9$ ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -117,9 +122,6 @@ def extract_words(texts, top_n=50):
 
 
 def extract_phrases(texts, top_n=25):
-    """
-    Simple bigram phrases (no NLP dependency).
-    """
     bigrams = []
     for t in texts:
         t = clean_text(t).lower()
@@ -129,46 +131,69 @@ def extract_phrases(texts, top_n=25):
     return Counter(bigrams).most_common(top_n)
 
 
+def request_with_retry(url, headers=None, params=None, timeout=15, attempts=4, backoff=1.4):
+    """
+    Retry on common bot/limit status codes.
+    Returns: (response_or_none, last_status_or_error_string)
+    """
+    headers = headers or BASE_HEADERS
+    last = None
+    for i in range(attempts):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
+            # Retry-worthy
+            if r.status_code in (429, 403, 503, 520, 521, 522):
+                last = f"HTTP {r.status_code}"
+                time.sleep(backoff * (i + 1))
+                continue
+            r.raise_for_status()
+            return r, f"HTTP {r.status_code}"
+        except Exception as e:
+            last = str(e)
+            time.sleep(backoff * (i + 1))
+    return None, last
+
+
 # ----------------------------
 # Data fetchers
 # ----------------------------
 @st.cache_data(ttl=300)
 def get_cnn_fear_greed():
     """
-    Returns: (score_0_100, rating_text) or (None, None)
+    Returns: (score_0_100, rating_text, debug_status)
     """
-    try:
-        r = requests.get(CNN_URL, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+    r, status = request_with_retry(
+        CNN_URL,
+        headers=CNN_HEADERS,
+        params={"_": int(time.time())},  # cachebuster
+        timeout=12,
+        attempts=4,
+        backoff=1.6,
+    )
+    if r is None:
+        return None, None, status
 
-        # CNN has varied structures over time; handle common patterns.
-        # Typical: data["fear_and_greed"]["score"] and ["rating"]
+    try:
+        data = r.json()
         fag = data.get("fear_and_greed", {})
         score = safe_float(fag.get("score"))
         rating = fag.get("rating")
 
-        # Fallback: some versions store latest in a time series
         if score is None:
-            # Try other plausible fields
-            # e.g., data["fear_and_greed"]["data"][-1]["y"]
             series = fag.get("data")
             if isinstance(series, list) and series:
-                last = series[-1]
-                score = safe_float(last.get("y"))
+                score = safe_float(series[-1].get("y"))
+
         if isinstance(rating, dict):
             rating = rating.get("text") or rating.get("rating")
 
-        return score, (rating or "N/A")
-    except Exception:
-        return None, None
+        return score, (rating or "N/A"), status
+    except Exception as e:
+        return None, None, f"{status} (json parse error: {e})"
 
 
 @st.cache_data(ttl=600)
 def get_vix_value():
-    """
-    Returns latest VIX close as float, or None.
-    """
     try:
         vix = yf.Ticker("^VIX")
         hist = vix.history(period="5d", interval="1d")
@@ -180,94 +205,89 @@ def get_vix_value():
 
 
 def vix_to_score(vix: float) -> float:
-    """
-    Convert VIX to a 0–100 greed score (lower VIX -> higher score).
-    Heuristic range: 10 (very calm) to 40 (very fearful).
-    """
     if vix is None:
         return None
+    # heuristic range: 10 calm -> 40 fearful
     return clamp((40.0 - vix) / (40.0 - 10.0) * 100.0)
 
 
 @st.cache_data(ttl=3600)
 def get_put_call_ratio_equity():
     """
-    Attempts to fetch Equity Put/Call ratio from CBOE daily page.
+    Much more reliable approach:
+    - Use CBOE page with ?dt=YYYY-MM-DD
+    - Regex extract "EQUITY PUT/CALL RATIO ... <number>"
+    Fallback: try read_html scan.
     Returns float or None.
-
-    This is the most fragile source on the internet, so we:
-    1) Try pandas.read_html on the page
-    2) Search any table for a row mentioning "Equity" and "Put/Call"
-    3) Extract the first float that looks like a ratio
     """
-    try:
-        r = requests.get(CBOE_URL, headers=HEADERS, timeout=12)
-        r.raise_for_status()
-        html = r.text
+    dt = date.today().isoformat()
+    url = f"{CBOE_URL}?dt={dt}"
 
-        # read_html often succeeds even when BeautifulSoup selectors break
+    r, status = request_with_retry(url, headers=BASE_HEADERS, timeout=15, attempts=4, backoff=1.5)
+    if r is None:
+        return None
+
+    html = r.text
+
+    # Primary: regex
+    m = re.search(r"EQUITY\s+PUT/CALL\s+RATIO[^0-9]*([0-9]+\.[0-9]+)", html, re.I)
+    if m:
+        val = safe_float(m.group(1))
+        if val is not None and 0.2 <= val <= 2.5:
+            return float(val)
+
+    # Fallback: read_html
+    try:
         tables = pd.read_html(html)
         for df in tables:
-            # Normalize columns
-            df_cols = [str(c).lower() for c in df.columns]
-            df.columns = df_cols
-
-            # Make a combined row-string for matching
             for _, row in df.iterrows():
                 row_text = " ".join([str(x) for x in row.values]).lower()
                 if "equity" in row_text and ("put/call" in row_text or "put call" in row_text or "p/c" in row_text):
-                    # Extract candidate floats from the row
                     nums = re.findall(r"\b\d+\.\d+\b", row_text)
                     for n in nums:
                         val = safe_float(n)
-                        # Typical equity p/c is ~0.4 to ~1.6
                         if val is not None and 0.2 <= val <= 2.5:
                             return float(val)
-
-        return None
     except Exception:
-        return None
+        pass
+
+    return None
 
 
 def pcr_to_score(pcr: float) -> float:
-    """
-    Convert Put/Call Ratio to greed score (lower p/c -> greed, higher -> fear).
-    Heuristic range: 0.5 (greedy) to 1.3 (fearful).
-    """
     if pcr is None:
         return None
+    # heuristic range: 0.5 greedy -> 1.3 fearful
     return clamp((1.3 - pcr) / (1.3 - 0.5) * 100.0)
 
 
 @st.cache_data(ttl=1800)
 def get_google_trends_score():
     """
-    Uses pytrends to fetch FEAR_TERMS and GREED_TERMS (last 7 days).
-    Produces a 0–100 sentiment score:
-    - Higher fear searches -> lower score
-    - Higher greed searches -> higher score
-
     Returns float or None.
+    pytrends often gets blocked on cloud IPs; we retry with backoff and longer timeout.
     """
     try:
-        pytrends = TrendReq(hl="en-US", tz=0, retries=2, backoff_factor=0.2)
+        pytrends = TrendReq(
+            hl="en-US",
+            tz=0,
+            retries=5,
+            backoff_factor=0.5,
+            timeout=(10, 25),
+        )
         terms = FEAR_TERMS + GREED_TERMS
-
         pytrends.build_payload(terms, timeframe="now 7-d")
         df = pytrends.interest_over_time()
 
         if df is None or df.empty:
             return None
 
-        # Average per term across the period
         means = df[terms].mean(axis=0)
-
         fear = float(means[FEAR_TERMS].mean())
         greed = float(means[GREED_TERMS].mean())
 
         eps = 1e-9
-        # Net sentiment: range approx [-1..+1], then map to 0..100
-        net = (greed - fear) / (greed + fear + eps)
+        net = (greed - fear) / (greed + fear + eps)  # [-1..+1] approx
         score = 50.0 + 50.0 * net
         return clamp(score)
     except Exception:
@@ -277,14 +297,15 @@ def get_google_trends_score():
 @st.cache_data(ttl=600)
 def fetch_reddit_posts(sub: str, limit: int = 40):
     """
-    Fetches posts from Reddit public JSON.
-    Returns list of dicts with keys: title, selftext, score, num_comments
+    Fetches posts from Reddit public JSON (api.reddit.com).
+    Returns list of dicts with keys: title, selftext, upvotes, num_comments
     """
     url = REDDIT_NEW_JSON.format(sub=sub, limit=limit)
-    r = requests.get(url, headers=HEADERS, timeout=12)
-    r.raise_for_status()
-    data = r.json()
+    r, status = request_with_retry(url, headers=BASE_HEADERS, timeout=15, attempts=4, backoff=1.6)
+    if r is None:
+        raise RuntimeError(status)
 
+    data = r.json()
     children = data.get("data", {}).get("children", [])
     posts = []
     for c in children:
@@ -301,12 +322,12 @@ def fetch_reddit_posts(sub: str, limit: int = 40):
 def score_reddit_subreddit(sub: str, tickers, analyzer: SentimentIntensityAnalyzer, limit: int = 40):
     """
     Returns:
-      score_0_100, avg_compound, n_posts_used, texts_used(list[str])
+      score_0_100, avg_compound, n_posts_used, texts_used(list[str]), debug_note(str|None)
     """
     try:
         posts = fetch_reddit_posts(sub, limit=limit)
-    except Exception:
-        return None, None, 0, []
+    except Exception as e:
+        return None, None, 0, [], f"fetch failed: {e}"
 
     used = []
     weights = []
@@ -316,15 +337,11 @@ def score_reddit_subreddit(sub: str, tickers, analyzer: SentimentIntensityAnalyz
         text = (p.get("title", "") + " " + p.get("selftext", "")).strip()
         if not contains_any_ticker(text, tickers):
             continue
-
-        text = text.strip()
         if not text:
             continue
 
-        # Sentiment
         comp = analyzer.polarity_scores(text)["compound"]
 
-        # Weight posts modestly by engagement to reduce random noise
         up = p.get("upvotes", 0)
         cm = p.get("num_comments", 0)
         w = 1.0 + (min(up, 5000) ** 0.5) / 30.0 + (min(cm, 2000) ** 0.5) / 25.0
@@ -334,16 +351,14 @@ def score_reddit_subreddit(sub: str, tickers, analyzer: SentimentIntensityAnalyz
         used.append(text)
 
     if not compounds:
-        # No matches = unknown, not "neutral"
-        return None, None, 0, []
+        note = "no ticker matches" if tickers else "no usable posts"
+        return None, None, 0, [], note
 
-    # Weighted average compound (-1..+1)
-    wsum = sum(weights)
-    avg_comp = sum(c * w for c, w in zip(compounds, weights)) / (wsum if wsum else 1.0)
-
-    # Map to 0..100
+    wsum = sum(weights) or 1.0
+    avg_comp = sum(c * w for c, w in zip(compounds, weights)) / wsum
     score = clamp((avg_comp + 1.0) * 50.0)
-    return score, avg_comp, len(compounds), used
+
+    return score, avg_comp, len(compounds), used, None
 
 
 def compute_composite_score(
@@ -356,27 +371,22 @@ def compute_composite_score(
 ):
     """
     Composite:
-    - User controls reddit weight % of total composite.
-    - Remaining weight is split across CNN/VIX/PCR/Trends using base proportions.
-    - Missing components are dropped + weights renormalized.
-
-    Returns:
-      composite_score, weights_used(dict), components_used(dict)
+    - Reddit weight is user-controlled IF Reddit exists.
+    - Remaining weight split across CNN/VIX/PCR/Trends.
+    - Missing dropped + renormalized.
+    - If < MIN_COMPONENTS_FOR_COMPOSITE components available -> return None.
     """
     components = {}
     weights = {}
 
-    # Reddit weight is explicitly user-controlled if Reddit score exists
     w_reddit = (reddit_weight_pct / 100.0)
 
     if reddit_score is not None:
         components["Reddit"] = float(reddit_score)
         weights["Reddit"] = w_reddit
 
-    # Remaining weight budget
-    remaining = 1.0 - (weights.get("Reddit", 0.0))
+    remaining = 1.0 - weights.get("Reddit", 0.0)
 
-    # Base distribution for the remaining bucket
     base = {
         "CNN": 0.50,
         "VIX": 0.20,
@@ -384,7 +394,6 @@ def compute_composite_score(
         "Trends": 0.10
     }
 
-    # Assign values if available
     if cnn_score is not None:
         components["CNN"] = float(cnn_score)
         weights["CNN"] = remaining * base["CNN"]
@@ -401,20 +410,19 @@ def compute_composite_score(
         components["Trends"] = float(trends_score)
         weights["Trends"] = remaining * base["Trends"]
 
-    if not components:
-        return None, {}, {}
+    # Require at least 2 components, otherwise composite is misleading
+    if len(components) < MIN_COMPONENTS_FOR_COMPOSITE:
+        return None, {}, {}, "Insufficient data: need at least 2 components."
 
-    # Drop any missing (already done) then renormalize weights to sum to 1
     total_w = sum(weights.values())
     if total_w <= 0:
-        return None, {}, {}
+        return None, {}, {}, "Composite weights sum to 0."
 
     composite = sum(components[k] * weights[k] for k in components) / total_w
     composite = round(float(composite), 1)
 
-    # Normalize weights for display (sum=1)
     weights_norm = {k: (weights[k] / total_w) for k in weights}
-    return composite, weights_norm, components
+    return composite, weights_norm, components, None
 
 
 def market_label(score: float) -> str:
@@ -432,12 +440,7 @@ def market_label(score: float) -> str:
 
 
 def save_history_row(row: dict):
-    """
-    Writes/updates a single daily record to HISTORICAL_FILE.
-    Avoid duplicates on rerun by updating today's row if present.
-    """
     today_str = date.today().isoformat()
-
     df_new = pd.DataFrame([row])
     df_new["date"] = today_str
 
@@ -465,13 +468,18 @@ st.caption(
 )
 
 colA, colB = st.columns([2, 1])
-
 with colA:
-    ticker_input = st.text_input("Stock Ticker(s) (optional – filters Reddit titles/body)", placeholder="e.g., NVDA, TSLA")
+    ticker_input = st.text_input(
+        "Stock Ticker(s) (optional – filters Reddit titles/body)",
+        placeholder="e.g., NVDA, TSLA"
+    )
 with colB:
     subs_input = st.text_input("Subreddits (comma-separated)", value="wallstreetbets,stocks,investing")
 
-reddit_weight = st.slider("Reddit Weight in Composite Score (%)", min_value=0, max_value=60, value=30, step=5)
+reddit_weight = st.slider(
+    "Reddit Weight in Composite Score (%)",
+    min_value=0, max_value=60, value=30, step=5
+)
 
 tickers = parse_tickers(ticker_input)
 subreddits = [s.strip() for s in subs_input.split(",") if s.strip()]
@@ -483,22 +491,23 @@ analyzer = SentimentIntensityAnalyzer()
 # Fetch + compute
 # ----------------------------
 with st.spinner("Fetching data…"):
-    cnn_score, cnn_rating = get_cnn_fear_greed()
+    cnn_score, cnn_rating, cnn_debug = get_cnn_fear_greed()
 
     # Reddit per-sub scoring
     subreddit_rows = []
     all_texts = []
     reddit_scores = []
+    reddit_debug_notes = {}
 
     for sub in subreddits:
-        # polite tiny delay across sub requests
         time.sleep(0.15)
-
-        s_score, s_comp, n_used, texts_used = score_reddit_subreddit(sub, tickers, analyzer, limit=50)
+        s_score, s_comp, n_used, texts_used, note = score_reddit_subreddit(sub, tickers, analyzer, limit=50)
         if texts_used:
             all_texts.extend(texts_used)
         if s_score is not None:
             reddit_scores.append(s_score)
+        if note:
+            reddit_debug_notes[sub] = note
 
         subreddit_rows.append({
             "subreddit": sub,
@@ -507,7 +516,6 @@ with st.spinner("Fetching data…"):
             "posts_used": int(n_used),
         })
 
-    # Aggregate Reddit score as average of available subreddit scores
     reddit_score = round(float(sum(reddit_scores) / len(reddit_scores)), 1) if reddit_scores else None
 
     # Proxies
@@ -520,8 +528,7 @@ with st.spinner("Fetching data…"):
     trends_score = get_google_trends_score()
     trends_score = None if trends_score is None else round(float(trends_score), 1)
 
-    # Composite
-    composite, weights_used, comps_used = compute_composite_score(
+    composite, weights_used, comps_used, composite_note = compute_composite_score(
         cnn_score=cnn_score,
         reddit_score=reddit_score,
         vix_score=vix_score,
@@ -537,14 +544,15 @@ st.markdown("## Core Sentiment Scores")
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.metric("CNN Fear & Greed", "N/A" if cnn_score is None else f"{cnn_score:.1f}", delta=cnn_rating if cnn_rating else None)
+    st.metric("CNN Fear & Greed", "N/A" if cnn_score is None else f"{cnn_score:.1f}",
+              delta=cnn_rating if cnn_rating else None)
     st.caption("Source: CNN (graphdata JSON)")
 
 with c2:
     if reddit_score is None:
         st.metric("Reddit Proxy (Retail Sentiment)", "N/A")
         if tickers:
-            st.caption("No matching ticker mentions found in recent posts.")
+            st.caption("No matching ticker mentions found in recent posts (or fetch blocked).")
         else:
             st.caption("Reddit fetch failed or no usable posts.")
     else:
@@ -553,7 +561,10 @@ with c2:
 
 with c3:
     st.metric("Composite Score (Enhanced)", "N/A" if composite is None else f"{composite:.1f}")
-    st.caption(f"Regime: {market_label(composite)}" if composite is not None else "Regime: Unknown")
+    if composite is None and composite_note:
+        st.caption(f"Regime: Unknown • {composite_note}")
+    else:
+        st.caption(f"Regime: {market_label(composite)}" if composite is not None else "Regime: Unknown")
 
 # Explain weights actually used
 with st.expander("How the composite is built (weights used for this run)"):
@@ -561,18 +572,18 @@ with st.expander("How the composite is built (weights used for this run)"):
         st.write("No composite available (missing inputs).")
     else:
         wdf = pd.DataFrame(
-            [{"Component": k, "Weight": round(v, 3), "Score": round(comps_used.get(k, float("nan")), 1)} for k, v in weights_used.items()]
+            [{"Component": k, "Weight": round(v, 3), "Score": round(comps_used.get(k, float("nan")), 1)}
+             for k, v in weights_used.items()]
         ).sort_values("Weight", ascending=False)
         st.dataframe(wdf, use_container_width=True)
-        st.caption(
-            "If a source fails (e.g., Put/Call N/A), it is dropped and the remaining weights are renormalized automatically."
-        )
+        st.caption("If a source fails (e.g., Put/Call N/A), it is dropped and the remaining weights are renormalized.")
 
 # ----------------------------
 # Display: Market proxies
 # ----------------------------
 st.markdown("## Market Proxies")
 p1, p2, p3 = st.columns(3)
+
 with p1:
     st.metric("VIX (raw)", "N/A" if vix_val is None else f"{vix_val:.2f}")
     st.caption("Lower VIX generally = more greed / calm markets")
@@ -588,8 +599,25 @@ with p3:
     st.caption("Net signal: greed-search terms vs fear-search terms (last 7 days)")
 
 # Alert
-alert = market_label(composite)
-st.markdown(f"### Market Alert: **{alert}**")
+st.markdown(f"### Market Alert: **{market_label(composite)}**")
+
+# ----------------------------
+# Debug expander (helps you see cloud blocks)
+# ----------------------------
+with st.expander("Debug: data source connectivity / reasons for N/A"):
+    st.write("CNN fetch:", cnn_debug)
+
+    # Quick status probes (non-cached)
+    _, reddit_probe = request_with_retry("https://api.reddit.com/r/wallstreetbets/new?limit=1", attempts=1)
+    st.write("Reddit probe:", reddit_probe)
+
+    _, cboe_probe = request_with_retry(f"{CBOE_URL}?dt={date.today().isoformat()}", attempts=1)
+    st.write("CBOE probe:", cboe_probe)
+
+    st.write("Notes per subreddit (if any):", reddit_debug_notes if reddit_debug_notes else "—")
+
+    st.write("If you see HTTP 403/418/429, the provider is blocking Streamlit Cloud IPs.")
+    st.write("Composite is intentionally disabled unless at least 2 components are available.")
 
 # ----------------------------
 # Subreddit breakdown
@@ -647,7 +675,6 @@ history_row = {
     "composite_score": None if composite is None else round(float(composite), 1),
 }
 
-# Save today’s row (update if exists)
 try:
     save_history_row(history_row)
 except Exception:
@@ -688,4 +715,6 @@ with c_clear:
         except Exception:
             st.error("Could not clear history file.")
 
-st.caption("Sources: CNN (graphdata JSON), Reddit public JSON, yfinance (^VIX), CBOE daily stats (HTML), Google Trends (pytrends) | Not financial advice")
+st.caption(
+    "Sources: CNN (graphdata JSON), Reddit public JSON, yfinance (^VIX), CBOE daily stats (HTML), Google Trends (pytrends) | Not financial advice"
+)
