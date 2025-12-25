@@ -8,3 +8,4 @@ matplotlib
 pytrends
 yfinance
 lxml
+beautifulsoup4
