@@ -1,0 +1,12 @@
+streamlit
+praw
+vaderSentiment
+python-dotenv
+requests
+beautifulsoup4
+pandas
+plotly
+wordcloud
+matplotlib
+pytrends
+yfinance
